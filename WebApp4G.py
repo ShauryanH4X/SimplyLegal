@@ -6,14 +6,35 @@ import re
 from flask import Flask, request, jsonify, session, send_file
 import google.generativeai as genai
 
+import io
+import textwrap
 from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import inch
 
 # ------------------------------
 # Helper functions
 # ------------------------------
+import uuid
+from datetime import datetime, timedelta
+
+def generate_session_id():
+    """Generate a unique session ID for document storage."""
+    return str(uuid.uuid4())
+
+def cleanup_old_documents():
+    """Clean up documents older than 15 minutes."""
+    current_time = datetime.now()
+    expired_keys = []
+    for key, data in document_storage.items():
+        if current_time - data['timestamp'] > timedelta(minutes=15):
+            expired_keys.append(key)
+    
+    for key in expired_keys:
+        del document_storage[key]
+
 def clean_ai_response(text):
     """Remove markdown-style backticks from AI response so it can be parsed as JSON."""
     if not text:
@@ -32,6 +53,11 @@ def extract_text_from_pdf(filepath):
                 text += page_text + "\n"
     return text.strip()
 
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+import io
 
 def create_pdf(summary):
     pdf_buffer = io.BytesIO()
@@ -102,7 +128,17 @@ def create_pdf(summary):
 # Flask app setup
 # ------------------------------
 app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev_secret")
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "your-secret-key-here-make-it-long-and-random")
+
+# Configure session settings
+from datetime import timedelta
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=10)
+app.config['SESSION_COOKIE_SECURE'] = False  # Set to True in production with HTTPS
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+
+# In-memory storage for document content (in production, use Redis or database)
+document_storage = {}
 
 # Configure Google API
 API_KEY = "AIzaSyCLmVvSBRjkJwJIRmeA9KbnB70Mom44RwU"  # replace with your actual key
@@ -698,8 +734,10 @@ def index():
                 }
 
                 sessionStorage.setItem("last_summary", JSON.stringify(data));
+                sessionStorage.setItem("last_doc_uploaded", "true");
+                sessionStorage.setItem("session_start_time", new Date().getTime());
                 displaySummary(data);
-                showSuccess("Document processed successfully!");
+                showSuccess("Document processed successfully! Session will expire in 10 minutes.");
                 
             } catch (error) {
                 showError("Failed to process document. Please try again.");
@@ -755,6 +793,34 @@ def index():
             `;
         }
 
+        function checkSessionExpiry() {
+            const sessionStartTime = sessionStorage.getItem("session_start_time");
+            if (sessionStartTime) {
+                const currentTime = new Date().getTime();
+                const elapsedMinutes = (currentTime - parseInt(sessionStartTime)) / (1000 * 60);
+                
+                if (elapsedMinutes >= 10) {
+                    // Session expired
+                    sessionStorage.removeItem("last_doc_uploaded");
+                    sessionStorage.removeItem("session_start_time");
+                    sessionStorage.removeItem("last_summary");
+                    showError("Your session has expired. Please upload your document again.");
+                    
+                    // Reset the UI
+                    document.getElementById("summary").innerHTML = `
+                        <div style="text-align: center; padding: 3rem; color: #64748b;">
+                            <i class="fas fa-arrow-up" style="font-size: 2rem; margin-bottom: 1rem;"></i>
+                            <p>Upload a document to see the simplified summary here</p>
+                        </div>
+                    `;
+                    document.getElementById("summary").className = "summary-content";
+                    
+                    return false; // Session expired
+                }
+            }
+            return true; // Session valid
+        }
+
         async function askQuestion() {
             const questionInput = document.getElementById("question");
             const askBtn = document.getElementById("askBtn");
@@ -764,6 +830,17 @@ def index():
             const question = questionInput.value.trim();
             if (!question) {
                 showError("Please enter a question.");
+                return;
+            }
+
+            // Check session expiry first
+            if (!checkSessionExpiry()) {
+                return;
+            }
+
+            // Check if document was uploaded
+            if (!sessionStorage.getItem("last_doc_uploaded")) {
+                showError("Please upload a document first before asking questions.");
                 return;
             }
 
@@ -784,7 +861,15 @@ def index():
                 let data = await res.json();
                 
                 if (data.error) {
-                    showError(data.error);
+                    if (data.error.includes("session has expired") || data.error.includes("No document uploaded")) {
+                        // Clear client storage on server session expiry
+                        sessionStorage.removeItem("last_doc_uploaded");
+                        sessionStorage.removeItem("session_start_time");
+                        sessionStorage.removeItem("last_summary");
+                        showError("Your session has expired. Please upload your document again.");
+                    } else {
+                        showError(data.error);
+                    }
                 } else {
                     answerEl.textContent = data.answer;
                     answerSection.style.display = "block";
@@ -871,13 +956,32 @@ def upload():
     if not doc_text:
         return jsonify({"error": "Failed to extract text from PDF"}), 400
 
-    session["last_doc"] = doc_text
+    # Clean up old documents periodically
+    cleanup_old_documents()
+    
+    # Generate unique session ID for this document
+    doc_session_id = generate_session_id()
+    
+    # Store document in memory with timestamp
+    document_storage[doc_session_id] = {
+        'content': doc_text,
+        'timestamp': datetime.now(),
+        'filename': file.filename
+    }
+    
+    # Store only the session ID in Flask session (much smaller)
+    session.permanent = True
+    session["doc_session_id"] = doc_session_id
+    session["doc_uploaded"] = True
 
     try:
         response = model.generate_content([PROMPT_JSON, doc_text])
         text_output = clean_ai_response(response.text if response else "")
         data = json.loads(text_output)
-        session["last_summary"] = data
+        
+        # Store summary in document storage too
+        document_storage[doc_session_id]['summary'] = data
+        
     except Exception as e:
         return jsonify({"error": f"AI call failed: {str(e)}", "raw": response.text if response else ""}), 500
 
@@ -885,8 +989,19 @@ def upload():
 
 @app.route("/ask", methods=["POST"])
 def ask():
-    if "last_doc" not in session:
-        return jsonify({"error": "No document uploaded yet."}), 400
+    doc_session_id = session.get("doc_session_id")
+    
+    if not doc_session_id or doc_session_id not in document_storage:
+        return jsonify({"error": "No document uploaded yet. Please upload a document first."}), 400
+
+    # Check if document has expired
+    doc_data = document_storage[doc_session_id]
+    if datetime.now() - doc_data['timestamp'] > timedelta(minutes=10):
+        # Clean up expired document
+        del document_storage[doc_session_id]
+        session.pop("doc_session_id", None)
+        session.pop("doc_uploaded", None)
+        return jsonify({"error": "Document session has expired. Please upload the document again."}), 400
 
     payload = request.get_json()
     question = payload.get("question")
@@ -896,7 +1011,7 @@ def ask():
     try:
         response = model.generate_content([
             "Here is the legal document:",
-            session["last_doc"],
+            doc_data['content'],
             f"User question: {question}"
         ])
         answer_text = response.text if response else "No response from AI"
@@ -907,14 +1022,20 @@ def ask():
 
 @app.route("/download_summary", methods=["GET"])
 def download_summary():
-    if "last_summary" not in session:
+    doc_session_id = session.get("doc_session_id")
+    
+    if not doc_session_id or doc_session_id not in document_storage:
+        return jsonify({"error": "No summary available"}), 400
+    
+    summary_data = document_storage[doc_session_id].get('summary')
+    if not summary_data:
         return jsonify({"error": "No summary available"}), 400
 
-    pdf_file = create_pdf(session["last_summary"])
+    pdf_file = create_pdf(summary_data)
     return send_file(pdf_file, download_name="summary.pdf", as_attachment=True)
 
 # ------------------------------
 # Run server
 # ------------------------------
 if __name__ == "__main__":
-    app.run()
+    app.run(debug=True, port=5000)
