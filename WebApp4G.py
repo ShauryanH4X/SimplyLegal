@@ -145,7 +145,7 @@ API_KEY = "AIzaSyCLmVvSBRjkJwJIRmeA9KbnB70Mom44RwU"  # replace with your actual 
 if not API_KEY:
     raise RuntimeError("Please set a valid API_KEY")
 genai.configure(api_key=API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+model = genai.GenerativeModel("gemini-2.5-flash")
 
 PROMPT_JSON = """
 You are a legal explainer. Simplify this legal document.
